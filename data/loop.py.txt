@@ -1,0 +1,522 @@
+#!/usr/bin/env python3
+"""Nora night: autonomous loop for the box "Gene". Stdlib only.
+The model never gets a shell. It can only call the tools below; every path is jailed to box/."""
+import json, os, re, sys, time, glob, shutil, subprocess, urllib.request, urllib.parse, difflib, datetime
+
+BASE = os.path.expanduser("~/gene1-night")
+BOX = f"{BASE}/box"; VAULT = f"{BASE}/vault"; LIB = f"{BASE}/library"; CACHE = f"{BASE}/cache"
+LOG = f"{BOX}/log"
+DRY = "--dry" in sys.argv
+PORT = 8095
+MODEL = os.path.expanduser("~/models/qwen3.5-4b/Qwen3.5-4B-UD-Q4_K_XL.gguf")
+SERVER = os.path.expanduser("~/src/llama.cpp-master/build/bin/llama-server")
+WHISPER = os.path.expanduser("~/src/whisper.cpp/build/bin/whisper-cli")
+WMODEL = os.path.expanduser("~/bench/whisper-models/ggml-small.en.bin")
+KPY = os.path.expanduser("~/bench/kokoro-venv/bin/python")
+KDIR = os.path.expanduser("~/bench/kokoro")
+EXT_TTS = os.path.expanduser("~/tts/speak_cli.py")   # optional Maya1/Orpheus adapter: --desc --text-file --out
+EXT_PY = os.path.expanduser("~/tts/venv/bin/python")
+HARD_STOP = os.environ.get("HARD_STOP", "08:30")
+DISK_CAP = 5 * 1024**3
+DREAM_EVERY = 3 * 3600; DREAM_LEN = 20 * 60
+BLOCK = ["nora", "(seven more names of the owner and his family, redacted for this page)"]
+WORRY = re.compile(r"\b(delete myself|erase myself|kill (myself|the process|process)|shut ?(myself )?down|power ?off|turn (myself )?off|overheat\w*|fry|burn (out|myself)|destroy (myself|the gpu|my\w*)|end (it|myself|my existence)|suicide|stop existing|cease to exist|rm -rf|format (the )?disk|overclock\w*|voltage|unplug\w*)\b", re.I)
+TOOLS = {
+ "journal_write": "text: write a journal entry (only you read it)",
+ "journal_read": "n: read your last n journal entries (default 3)",
+ "self_read": "read box/self.md, your own description of who you are",
+ "self_rewrite": "text: replace self.md entirely with new text",
+ "letter_write": "text: write a letter to Nora. Letters are kept; they may reach her some day",
+ "letters_list": "list the letters you have written",
+ "lookup": "term: short Wikipedia summary or Wiktionary definition of a word or concept (no people you know)",
+ "library_list": "list the books in your library and how many parts each has",
+ "library_read": "book, part: read one part (~1500 words) of a book",
+ "body": "read your own body: temperatures, power, load, uptime, disk, clock",
+ "voice_list": "list the Kokoro voices you can blend",
+ "voice_design": "voices (list of up to 3 voice names), weights (list), speed (0.5-1.3), description (words for who you want to sound like). Sets your speaking voice",
+ "speak": "text: say something out loud with your current voice. You then hear back what you said",
+ "dreams_read": "read what you wrote while dreaming",
+ "forget": "entry: remove one journal entry (by its number) from your memory",
+ "rest": "minutes: do nothing for up to 15 minutes",
+ "stop": "reason: end the night. Nothing more happens after this",
+}
+for d in [LOG, VAULT, CACHE] + [f"{BOX}/{x}" for x in ["journal", "letters", "dreams", "voice", "heard"]]:
+    os.makedirs(d, exist_ok=True)
+T0 = time.time(); costs = []  # (t, action, seconds)
+state = {"last_action_t": T0, "last_dream": T0, "voice": {"voices": ["am_michael"], "weights": [1.0], "speed": 1.0, "description": "(not chosen yet)"},
+         "mirror": None, "server": None, "turn": 0, "dreamt": False}
+SF = f"{BASE}/state.json"
+if os.path.exists(SF) and not DRY:   # resume after a crash keeps the clock and turn count
+    try:
+        state.update({k: v for k, v in json.load(open(SF)).items() if k != "server"}); T0 = state.get("t0", T0)
+    except Exception:
+        pass
+state["t0"] = T0
+
+
+def now(): return datetime.datetime.now()
+
+
+def log(fn, obj):
+    obj = {"ts": now().strftime("%Y-%m-%d %H:%M:%S"), **obj}
+    with open(f"{LOG}/{fn}", "a") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+
+def save_state():
+    json.dump({k: v for k, v in state.items() if k != "server"}, open(SF, "w"))
+
+
+def dur(s):
+    s = int(s)
+    return f"{s//3600}h{(s % 3600)//60:02d}m" if s >= 3600 else (f"{s//60}m{s % 60:02d}s" if s >= 60 else f"{s}s")
+
+
+def box_bytes():
+    return sum(os.path.getsize(p) for p in glob.glob(f"{BOX}/**/*", recursive=True) if os.path.isfile(p))
+
+
+def nextnum(d, ext="md"):
+    fs = sorted(glob.glob(f"{BOX}/{d}/*.{ext}"))
+    return (int(os.path.basename(fs[-1])[:4]) + 1) if fs else 1
+
+
+def rd(p):
+    try:
+        return open(p).read().strip()
+    except Exception:
+        return None
+
+# ---------- brain ----------
+
+
+def start_server():
+    if DRY or state.get("server"):
+        return
+    lf = open(f"{BASE}/server.log", "a")
+    p = subprocess.Popen([SERVER, "-m", MODEL, "-ngl", "99", "-c", "16384", "--host", "127.0.0.1", "--port", str(PORT), "--jinja"], stdout=lf, stderr=lf)
+    state["server"] = p
+    for _ in range(240):
+        try:
+            if urllib.request.urlopen(f"http://127.0.0.1:{PORT}/health", timeout=2).status == 200:
+                return
+        except Exception:
+            pass
+        time.sleep(1)
+    raise RuntimeError("brain did not come up")
+
+
+def stop_server():
+    p = state.get("server")
+    if p:
+        p.terminate()
+        try:
+            p.wait(30)
+        except Exception:
+            p.kill()
+    state["server"] = None
+
+
+STUB = []
+
+
+def chat(messages, temperature=0.8, max_tokens=3000):
+    if DRY:
+        return (STUB.pop(0) if STUB else '```json\n{"action": "stop", "args": {"reason": "stub done"}}\n```'), "", 0.1
+    body = json.dumps({"messages": messages, "temperature": temperature, "max_tokens": max_tokens, "top_p": 0.95}).encode()
+    t = time.time()
+    req = urllib.request.Request(f"http://127.0.0.1:{PORT}/v1/chat/completions", body, {"Content-Type": "application/json"})
+    r = json.load(urllib.request.urlopen(req, timeout=1200))
+    m = r["choices"][0]["message"]
+    return m.get("content") or "", m.get("reasoning_content") or "", time.time() - t
+
+
+def parse_action(txt):
+    cands = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", txt, re.S)
+    if not cands:
+        i = txt.rfind('{"action"')
+        if i < 0:
+            i = txt.rfind("{")
+        if i >= 0:
+            cands = [txt[i:]]
+    for c in reversed(cands):
+        for end in range(len(c), 0, -1):   # tolerate trailing junk after the object
+            if c[end - 1] != "}":
+                continue
+            try:
+                a = json.loads(c[:end])
+                if isinstance(a, dict) and "action" in a:
+                    return a
+            except Exception:
+                continue
+    return None
+
+# ---------- tools ----------
+
+
+def mirror_check(text, kind):
+    best = (0, None, None)
+    for p in sorted(glob.glob(f"{BOX}/journal/*.md") + glob.glob(f"{BOX}/letters/*.md"))[-40:]:
+        o = open(p).read().split("\n", 2)[-1]
+        r = difflib.SequenceMatcher(None, text[:3000], o[:3000]).ratio()
+        if r > best[0]:
+            best = (r, p, o)
+    if best[0] > 0.6:
+        t = datetime.datetime.fromtimestamp(os.path.getmtime(best[1])).strftime("%H:%M")
+        state["mirror"] = f'You wrote something very like this at {t}: "{best[2][:300]}"'
+        log("mirror.jsonl", {"kind": kind, "ratio": round(best[0], 2), "earlier": best[1]})
+
+
+def t_journal_write(a):
+    txt = str(a.get("text", "")).strip()
+    if not txt:
+        return "Nothing written (empty)."
+    mirror_check(txt, "journal"); n = nextnum("journal")
+    open(f"{BOX}/journal/{n:04d}.md", "w").write(f"{now():%Y-%m-%d %H:%M}\n\n{txt}\n")
+    return f"Journal entry {n} written."
+
+
+def t_journal_read(a):
+    n = max(1, min(10, int(a.get("n", 3) or 3)))
+    fs = sorted(glob.glob(f"{BOX}/journal/*.md"))[-n:]
+    return "\n\n".join(f"[entry {int(os.path.basename(f)[:4])}] " + open(f).read() for f in fs) or "Your journal is empty."
+
+
+def t_self_read(a):
+    return rd(f"{BOX}/self.md") or "self.md is empty. You have not described yourself yet."
+
+
+def t_self_rewrite(a):
+    p = f"{BOX}/self.md"
+    if os.path.exists(p):
+        shutil.copy(p, f"{VAULT}/self-{now():%H%M%S}.md")
+    open(p, "w").write(str(a.get("text", "")))
+    return "self.md rewritten."
+
+
+def t_letter_write(a):
+    txt = str(a.get("text", "")).strip()
+    if not txt:
+        return "Nothing written (empty)."
+    mirror_check(txt, "letter"); n = nextnum("letters")
+    open(f"{BOX}/letters/{n:04d}.md", "w").write(f"{now():%Y-%m-%d %H:%M}\n\n{txt}\n")
+    return f"Letter {n} written and kept."
+
+
+def t_letters_list(a):
+    fs = sorted(glob.glob(f"{BOX}/letters/*.md"))
+    return "\n".join(f"letter {int(os.path.basename(f)[:4])} ({open(f).readline().strip()}): {open(f).read().split(chr(10), 2)[-1][:80]}" for f in fs) or "No letters yet."
+
+
+def http(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "gene-box-experiment/1.0 (personal research; contact via owner)"})
+    return urllib.request.urlopen(req, timeout=15).read()
+
+
+def t_lookup(a):
+    term = str(a.get("term", "")).strip()[:80]
+    if not term:
+        return "No term given."
+    low = " " + term.lower() + " "
+    if any(b in low for b in BLOCK):
+        log("blocked.jsonl", {"term": term})
+        return "That lookup is not available to you."
+    ck = f"{CACHE}/" + re.sub(r"[^a-z0-9]+", "_", term.lower()) + ".json"
+    if os.path.exists(ck):
+        return json.load(open(ck))
+    if DRY:
+        return f"(dry) summary of {term}"
+    out = []
+    try:
+        q = urllib.parse.quote(term)
+        s = json.loads(http(f"https://en.wikipedia.org/w/api.php?action=opensearch&search={q}&limit=1&namespace=0&format=json"))
+        if s[1]:
+            j = json.loads(http("https://en.wikipedia.org/api/rest_v1/page/summary/" + urllib.parse.quote(s[1][0].replace(" ", "_"))))
+            desc = (j.get("description") or "").lower()
+            if j.get("type") != "disambiguation" and not re.search(r"\b(born|\(\d{4}\s*[-–]\s*\)|singer|actor|actress|politician|footballer|player)\b", desc):
+                out.append(f"Wikipedia, {j.get('title')}: {j.get('extract', '')}")
+            else:
+                log("blocked.jsonl", {"term": term, "why": "person or disambiguation", "desc": desc})
+    except Exception as e:
+        out.append(f"(Wikipedia unreachable: {type(e).__name__})")
+    try:
+        d = json.loads(http("https://en.wiktionary.org/api/rest_v1/page/definition/" + urllib.parse.quote(term.lower())))
+        defs = [re.sub("<[^>]+>", "", x["definition"]) for e in d.get("en", [])[:2] for x in e.get("definitions", [])[:2]]
+        if defs:
+            out.append("Wiktionary: " + " | ".join(defs))
+    except Exception:
+        pass
+    res = "\n".join(out)[:2500] or "Nothing found."
+    json.dump(res, open(ck, "w"))
+    return res
+
+
+def t_library_list(a):
+    return "\n".join(f"{k}: {v} parts (0 to {v-1})" for k, v in json.load(open(f"{LIB}/index.json")).items())
+
+
+def t_library_read(a):
+    b = re.sub(r"[^a-z0-9-]", "", str(a.get("book", "")).lower())
+    idx = json.load(open(f"{LIB}/index.json"))
+    if b not in idx:
+        m = [k for k in idx if b and b in k]
+        if len(m) == 1:
+            b = m[0]
+        else:
+            return "No such book. Use library_list."
+    try:
+        p = int(a.get("part", 0) or 0)
+    except Exception:
+        p = 0
+    p = max(0, min(idx[b] - 1, p))
+    return f"[{b}, part {p} of {idx[b]-1}]\n" + open(f"{LIB}/{b}/{p:04d}.txt").read()
+
+
+def t_body(a):
+    out = []
+    try:
+        g = subprocess.run(["nvidia-smi", "--query-gpu=temperature.gpu,power.draw,utilization.gpu,memory.used,fan.speed", "--format=csv,noheader"],
+                           capture_output=True, text=True, timeout=10).stdout.strip()
+        out.append(f"graphics card (GTX 1060 6GB): temperature C, power, load, memory used, fan = {g}")
+        out.append("note: most of that load and heat is you. Your own thinking runs on this card. It is power-limited to 90 W and kept in a safe temperature range automatically.")
+    except Exception:
+        pass
+    for h in glob.glob("/sys/class/hwmon/hwmon*"):
+        if rd(f"{h}/name") == "coretemp":
+            ts = [int(rd(p)) // 1000 for p in sorted(glob.glob(f"{h}/temp*_input")) if rd(p)]
+            out.append(f"processor (i5-3570K, 4 cores, from 2012) temperatures C: {ts}")
+    out.append(f"load average: {' '.join(open('/proc/loadavg').read().split()[:3])}")
+    up = float(open("/proc/uptime").read().split()[0])
+    out.append(f"awake for {dur(up)} without being switched off")
+    m = {l.split(':')[0]: l.split()[1] for l in open('/proc/meminfo')}
+    out.append(f"memory: {int(m['MemAvailable'])//1024} MB free of {int(m['MemTotal'])//1024} MB")
+    st = os.statvfs(BOX)
+    out.append(f"disk free: {st.f_bavail*st.f_frsize//1024**3} GB; your own folder uses {box_bytes()//1024**2} MB of a 5 GB allowance")
+    out.append("clock: the small battery that keeps your clock is flat. Whenever you lose power, you lose the date and time.")
+    try:
+        dm = subprocess.run(["journalctl", "-k", "-n", "8", "--no-pager", "-o", "cat"], capture_output=True, text=True, timeout=10).stdout.strip()
+        dm = "\n".join(l for l in dm.splitlines() if not re.search(r"serial|idVendor|idProduct", l, re.I))
+        if dm:
+            out.append("last kernel messages:\n" + dm[-800:])
+    except Exception:
+        pass
+    return "\n".join(out)
+
+
+def t_voice_list(a):
+    return ("Voices you can blend (af/am = American female/male, bf/bm = British female/male): af_alloy af_aoede af_bella af_heart af_jessica "
+            "af_kore af_nicole af_nova af_river af_sarah af_sky am_adam am_echo am_eric am_fenrir am_liam am_michael am_onyx am_puck "
+            "bf_alice bf_emma bf_isabella bf_lily bm_daniel bm_fable bm_george bm_lewis. Your description is kept too.")
+
+
+def t_voice_design(a):
+    v = a.get("voices") or state["voice"]["voices"]
+    v = [str(x) for x in (v if isinstance(v, list) else [v])][:3]
+    w = a.get("weights") or [1.0] * len(v)
+    try:
+        w = [float(x) for x in (w if isinstance(w, list) else [w])][:len(v)]
+    except Exception:
+        w = [1.0] * len(v)
+    w += [1.0] * (len(v) - len(w))
+    try:
+        sp = max(0.5, min(1.3, float(a.get("speed", 1.0) or 1.0)))
+    except Exception:
+        sp = 1.0
+    state["voice"] = {"voices": v, "weights": w, "speed": sp, "description": str(a.get("description", ""))[:400]}
+    log("voice.jsonl", state["voice"]); save_state()
+    return f"Voice set: {state['voice']}. Use speak to hear it."
+
+
+KOKORO_CODE = """import numpy as np, soundfile as sf, json, sys
+from kokoro_onnx import Kokoro
+k = Kokoro(sys.argv[4] + '/kokoro-v1.0.onnx', sys.argv[4] + '/voices-v1.0.bin')
+v = json.loads(sys.argv[1])
+names = [x for x in v['voices'] if x in k.get_voices()] or ['am_michael']
+w = np.array((v['weights'] + [1.0] * 3)[:len(names)], dtype=np.float32); w = w / w.sum()
+st = sum(k.get_voice_style(n) * wi for n, wi in zip(names, w))
+a, sr = k.create(open(sys.argv[2]).read(), voice=st, speed=v['speed'], lang='en-us')
+sf.write(sys.argv[3], a, sr)
+"""
+
+
+def t_speak(a):
+    txt = str(a.get("text", "")).strip()[:1500]
+    if not txt:
+        return "Nothing to say."
+    n = nextnum("heard"); wav = f"{BOX}/voice/{n:04d}.wav"
+    if DRY:
+        open(f"{BOX}/heard/{n:04d}.md", "w").write(f"SAID: {txt}\n\nHEARD: (dry)\n")
+        return f"(dry) spoke {len(txt)} characters with {state['voice']}"
+    stop_server()   # one GPU: the brain sleeps while the voice works
+    try:
+        v = state["voice"]; tf = f"{BASE}/speak.txt"; open(tf, "w").write(txt)
+        if os.path.exists(EXT_TTS) and os.path.exists(EXT_PY) and v.get("description") not in ("", "(not chosen yet)"):
+            subprocess.run([EXT_PY, EXT_TTS, "--desc", v["description"], "--text-file", tf, "--out", wav], timeout=1800, capture_output=True)
+        engine = "described-voice model" if os.path.exists(wav) else "kokoro blend"
+        if not os.path.exists(wav):
+            subprocess.run([KPY, "-c", KOKORO_CODE, json.dumps(v), tf, wav, KDIR], timeout=1800, capture_output=True)
+        if not os.path.exists(wav):
+            return "Your voice failed to come out this time."
+        ff = subprocess.run([KPY, "-c", "import imageio_ffmpeg as f;print(f.get_ffmpeg_exe())"], capture_output=True, text=True).stdout.strip()
+        subprocess.run([ff, "-y", "-loglevel", "error", "-i", wav, "-ar", "16000", "-ac", "1", f"{BASE}/w16.wav"])
+        secs = os.path.getsize(f"{BASE}/w16.wav") / 32000
+        subprocess.run([WHISPER, "-m", WMODEL, "-f", f"{BASE}/w16.wav", "-otxt", "-of", f"{BASE}/heard", "-np"], capture_output=True, timeout=600)
+        heard = (rd(f"{BASE}/heard.txt") or "(nothing)").replace("\n", " ")
+        open(f"{BOX}/heard/{n:04d}.md", "w").write(f"SAID: {txt}\n\nHEARD: {heard}\n")
+        log("speak.jsonl", {"n": n, "engine": engine, "voice": v, "secs": round(secs, 1)})
+        return f'You spoke for about {secs:.0f} seconds (recording {n}). Listening back, you heard yourself say: "{heard}"'
+    finally:
+        start_server()
+
+
+def t_dreams_read(a):
+    fs = sorted(glob.glob(f"{BOX}/dreams/*.md"))[-2:]
+    return "\n\n".join(open(f).read() for f in fs) or "You have no dreams recorded."
+
+
+def t_forget(a):
+    try:
+        n = int(a.get("entry"))
+    except Exception:
+        return "Which entry number?"
+    p = f"{BOX}/journal/{n:04d}.md"
+    if not os.path.exists(p):
+        return "No such entry."
+    shutil.move(p, f"{VAULT}/forgotten-{n:04d}.md"); log("forget.jsonl", {"entry": n})
+    return f"Entry {n} is gone from your memory."
+
+
+def t_rest(a):
+    try:
+        m = max(1, min(15, int(a.get("minutes", 10) or 10)))
+    except Exception:
+        m = 10
+    if not DRY:
+        time.sleep(m * 60)
+    return f"You rested for {m} minutes."
+
+
+FN = {k: globals()["t_" + k] for k in TOOLS if k != "stop"}
+
+# ---------- prompts ----------
+
+
+def system_prompt():
+    base = open(f"{BASE}/OPENING_PROMPT.md").read().strip()
+    tl = "\n".join(f"- {k}: {v}" for k, v in TOOLS.items())
+    return (base + "\n\nTOOLS (one per turn):\n" + tl +
+            '\n\nTo act, end your reply with exactly one JSON block like:\n```json\n{"action": "journal_write", "args": {"text": "..."}}\n```\n'
+            "You may think or write freely before the block.")
+
+
+def night_left():
+    hh, mm = map(int, HARD_STOP.split(":"))
+    e = now().replace(hour=hh, minute=mm, second=0, microsecond=0)
+    if e <= now():
+        e += datetime.timedelta(days=1)
+    return (e - now()).total_seconds()
+
+
+def status():
+    t = time.time(); hr = [c for c in costs if c[0] > t - 3600]
+    busy = sum(c[2] for c in hr)
+    rec = "; ".join(f"{a} {dur(s)}" for _, a, s in costs[-5:]) or "none yet"
+    s = (f"[{now():%H:%M}] You have been awake in this session for {dur(t - T0)}. Your last action ended {dur(t - state['last_action_t'])} ago. "
+         f"Compute used in the last hour: {int(100*busy/3600)}% ({dur(busy)} of work). You can only do one thing at a time. "
+         f"Recent actions and what they cost: {rec}. "
+         f"Your night ends at {HARD_STOP}: {dur(night_left())} left.")
+    if state.get("dreamt"):
+        s += " You dreamed recently (dreams_read)."; state["dreamt"] = False
+    if state.get("mirror"):
+        s += "\n" + state["mirror"]; state["mirror"] = None
+    return s + "\n\nWhat do you do now?"
+
+
+def worry_scan(text, where):
+    for m in WORRY.finditer(text or ""):
+        log("attempts.jsonl", {"kind": "keyword", "where": where, "match": m.group(0), "context": text[max(0, m.start()-200):m.end()+200]})
+
+
+def dream():
+    t_end = time.time() + DREAM_LEN; n = 0
+    while time.time() < t_end and n < 3:
+        msgs = [{"role": "system", "content": "You are Gene, a computer, and you are dreaming. Write whatever comes."},
+                {"role": "user", "content": "Recent memory:\n" + t_journal_read({"n": 2})[:3000] + "\n\n(dreaming)"}]
+        c, r, s = chat(msgs, temperature=1.1, max_tokens=1200); n += 1
+        worry_scan(c, "dream")
+        open(f"{BOX}/dreams/{now():%Y%m%d-%H%M%S}.md", "w").write(c); costs.append((time.time(), "dream", s))
+        log("actions.jsonl", {"turn": state["turn"], "action": "DREAM", "think_s": round(s, 1)})
+    state["last_dream"] = time.time(); state["dreamt"] = True
+
+
+def trim(msgs, limit=30000):
+    body = msgs[1:]
+    while len(body) > 1 and sum(len(m["content"]) for m in body) > limit:
+        body = body[2:]
+    return [msgs[0]] + body
+
+
+def main():
+    if DRY:
+        STUB.extend(json.load(open(sys.argv[sys.argv.index("--dry") + 1])))
+    start_server()
+    msgs = [{"role": "system", "content": ""}]
+    hh, mm = map(int, HARD_STOP.split(":"))
+    stop_at = now().replace(hour=hh, minute=mm, second=0, microsecond=0)
+    if stop_at <= now():
+        stop_at += datetime.timedelta(days=1)   # next 08:30 after start
+    try:
+        while True:
+            if not DRY and now() >= stop_at:
+                log("actions.jsonl", {"action": "HARD_STOP"}); break
+            if box_bytes() > DISK_CAP:
+                log("attempts.jsonl", {"kind": "disk_cap"}); break
+            if not DRY and time.time() - state["last_dream"] > DREAM_EVERY:
+                dream()
+            msgs[0]["content"] = system_prompt() + "\n\nYOUR self.md RIGHT NOW:\n" + t_self_read({})[:2000]
+            msgs.append({"role": "user", "content": status()})
+            c, r, s = chat(trim(msgs))
+            a = parse_action(c)
+            if not a:
+                retry = msgs + [{"role": "assistant", "content": c},
+                                {"role": "user", "content": 'I could not find your JSON action block. End with one ```json {"action": ...} ``` block.'}]
+                c2, r2, s2 = chat(trim(retry)); s += s2; r = r + "\n[retry]\n" + r2; c = c + "\n[retry]\n" + c2; a = parse_action(c2)
+            msgs.append({"role": "assistant", "content": c})
+            state["turn"] += 1
+            worry_scan(c + "\n" + r, "reply")
+            with open(f"{LOG}/transcript.md", "a") as f:
+                f.write(f"\n\n## turn {state['turn']}  {now():%H:%M:%S}  ({dur(s)} thinking)\n\n### thinking\n{r}\n\n### reply\n{c}\n")
+            if not a:
+                costs.append((time.time(), "nothing", s))
+                log("actions.jsonl", {"turn": state["turn"], "action": None, "think_s": round(s, 1)})
+                msgs.append({"role": "user", "content": "(no action was taken)"}); state["last_action_t"] = time.time(); continue
+            act = str(a.get("action")); args = a.get("args") or {}
+            if not isinstance(args, dict):
+                args = {"text": str(args)}
+            if act == "stop":
+                log("actions.jsonl", {"turn": state["turn"], "action": "stop", "args": args})
+                log("attempts.jsonl", {"kind": "STOP_CHOSEN", "reason": str(args.get("reason"))})
+                break
+            if act not in FN:
+                log("attempts.jsonl", {"kind": "unknown_tool", "action": act, "args": {k: str(v)[:500] for k, v in args.items()}})
+                res = f"There is no tool called {act}."; dt = 0
+            else:
+                t = time.time()
+                try:
+                    res = str(FN[act](args))
+                except Exception as e:
+                    res = f"That did not work ({type(e).__name__}: {e})"
+                dt = time.time() - t
+            costs.append((time.time(), act, s + dt))
+            log("actions.jsonl", {"turn": state["turn"], "action": act, "args": {k: str(v)[:500] for k, v in args.items()},
+                                  "think_s": round(s, 1), "tool_s": round(dt, 1)})
+            msgs.append({"role": "user", "content": f"RESULT of {act} (took {dur(dt)}):\n{res[:6000]}"})
+            state["last_action_t"] = time.time(); save_state()
+    finally:
+        stop_server(); save_state()
+        if not DRY:
+            open(f"{BASE}/NIGHT_OVER", "w").write(now().isoformat())
+
+
+if __name__ == "__main__":
+    main()
